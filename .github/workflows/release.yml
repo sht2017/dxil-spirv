@@ -1,0 +1,95 @@
+name: Release
+
+# Builds the dxil-spirv CLI with its shared library for Windows and Linux. Pushing a tag v* publishes the archives and
+# their SHA256SUMS as a GitHub release; running the workflow by hand only uploads them as workflow artifacts.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: windows-x64
+            os: windows-2022
+          - target: linux-x64
+            os: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build (MSVC)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDXIL_SPIRV_CLI=ON -DDXIL_SPIRV_NATIVE_LLVM=OFF || exit /b 1
+          cmake --build build --target dxil-spirv || exit /b 1
+
+      - name: Build (GCC)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DDXIL_SPIRV_CLI=ON -DDXIL_SPIRV_NATIVE_LLVM=OFF '-DCMAKE_BUILD_RPATH=$ORIGIN'
+          cmake --build build --target dxil-spirv
+
+      - name: Package
+        shell: bash
+        run: |
+          name="dxil-spirv-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp build/dxil-spirv.exe build/dxil-spirv-c-shared.dll "dist/$name/"
+          else
+            cp build/dxil-spirv build/libdxil-spirv-c-shared.so* "dist/$name/"
+          fi
+          cp LICENSE.MIT "dist/$name/"
+          git rev-parse HEAD > "dist/$name/SOURCE_COMMIT"
+          git submodule status --recursive > "dist/$name/SUBMODULES"
+          cd dist
+          if [ "$RUNNER_OS" = Windows ]; then 7z a "$name.zip" "$name" > /dev/null; else tar czf "$name.tar.gz" "$name"; fi
+          rm -rf "$name"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxil-spirv-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "dxil-spirv CLI and shared library for Windows x64 and Linux x64, built from ${GITHUB_SHA}. Each archive lists its source commit (SOURCE_COMMIT) and submodule commits (SUBMODULES)."
